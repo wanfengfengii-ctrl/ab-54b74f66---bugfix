@@ -12,8 +12,11 @@ Exercises the whole contract over real HTTP (stdlib only):
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
+import socket
+import stat
 import time
 import urllib.error
 import urllib.request
@@ -105,6 +108,29 @@ def write_repair_plan(session, blob, bad, repaired=None, categories=None):
         json.dump(plan, fh)
 
 
+def rewrite_meta(session, total, digest):
+    """Silently rewrite the persistent session descriptor (meta.json).
+
+    Simulates the post-seal tampering where another on-disk description is
+    changed to a wrong file's length/digest while the receipt is untouched.
+    """
+    path = os.path.join(DATA, session, "meta.json")
+    with open(path, "w") as fh:
+        json.dump({
+            "total_size": total,
+            "sha256": digest,
+            "chunk_count": (total + CHUNK - 1) // CHUNK,
+        }, fh)
+
+
+def all_chunk_bytes(session, count):
+    out = []
+    for i in range(count):
+        with open(chunk_path(session, i), "rb") as fh:
+            out.append(fh.read())
+    return b"".join(out)
+
+
 def wait_healthy(timeout=30.0):
     deadline = time.time() + timeout
     last = None
@@ -117,6 +143,91 @@ def wait_healthy(timeout=30.0):
             last = exc
         time.sleep(0.5)
     raise SystemExit(f"service never became healthy: {last}")
+
+
+_DOCKER_SOCK = "/var/run/docker.sock"
+_web_container = None
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, path):
+        super().__init__("docker-local", timeout=20)
+        self._unix_path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self._unix_path)
+
+
+def _docker(method, path):
+    conn = _UnixHTTPConnection(_DOCKER_SOCK)
+    try:
+        conn.request(method, path)
+        resp = conn.getresponse()
+        # Consume (and discard) the body so the keep-alive connection closes.
+        raw = resp.read()
+        code = resp.status
+        if code == 404:
+            return 404, {}
+        if code >= 400:
+            raise RuntimeError(f"docker API {method} {path} -> {code}")
+        return code, json.loads(raw) if raw else {}
+    finally:
+        conn.close()
+
+
+def _find_web_container():
+    """Locate the compose `web` container id.
+
+    Prefers a container in this verify container's own compose project; if
+    the daemon rejects self-inspection (older API) falls back to the only
+    running container labelled compose service ``web``.
+    """
+    own = socket.gethostname()
+    project = None
+    try:
+        _, me = _docker("GET", f"/containers/{own}/json")
+        project = (me.get("Config", {}).get("Labels", {}) or {}).get(
+            "com.docker.compose.project"
+        )
+    except Exception:
+        pass
+    _, containers = _docker("GET", "/containers/json")
+    candidates = [
+        c for c in containers
+        if (c.get("Labels") or {}).get("com.docker.compose.service") == "web"
+        and c.get("State") == "running"
+        and (project is None
+             or (c.get("Labels") or {}).get("com.docker.compose.project") == project)
+    ]
+    if not candidates:
+        raise RuntimeError(f"no running compose web container found (project={project!r})")
+    return candidates[0]["Id"]
+
+
+def restart_web():
+    """Restart the web service through the Docker API, then wait it back up.
+
+    Proves that a contradictory persistent descriptor cannot flip the
+    verdict across a service restart. Skipped only when the Docker socket
+    is unavailable (the pytest suite covers the same restart semantics).
+    """
+    global _web_container
+    try:
+        is_socket = stat.S_ISSOCK(os.stat(_DOCKER_SOCK).st_mode)
+    except OSError:
+        is_socket = False
+    if not is_socket:
+        print(f"  [skip] {_DOCKER_SOCK} unavailable; restart check covered by pytest")
+        return
+    try:
+        if _web_container is None:
+            _web_container = _find_web_container()
+        _docker("POST", f"/containers/{_web_container}/restart?t=1")
+    except Exception as exc:
+        raise SystemExit(f"failed to restart web container: {exc}")
+    wait_healthy()
 
 
 def check(cond, label):
@@ -350,7 +461,123 @@ def main():
     status, body = call("POST", f"/api/uploads/{sd}/audit")
     check(body["status"] == "HEALTHY", "final audit after resume is HEALTHY")
 
-    print(f"\nSMOKE OK against {BASE} (sessions {s}, {sb}, {sa}, {sbx}, {sc}, {sd})")
+    print("[contradictory descriptor after sealing: wrong file never wins]")
+    # Three same-size multi-chunk sessions: descriptor conflict / missing
+    # block / normal, plus an old (index-less) session's first audit.
+    n_chunks = 4
+    blob_x = os.urandom(3 * CHUNK + 17)
+    sx = s + "X"
+    dx, rx = upload_and_seal(sx, blob_x)
+    blob_y = os.urandom(3 * CHUNK + 17)
+    sy = s + "Y"
+    dy, ry = upload_and_seal(sy, blob_y)
+    blob_z = os.urandom(3 * CHUNK + 17)
+    sz = s + "Z"
+    dz, rz = upload_and_seal(sz, blob_z)
+    blob_o = os.urandom(2 * CHUNK + 31)
+    so = s + "O"
+    do, ro = upload_and_seal(so, blob_o)
+
+    # (1) descriptor conflict: meta.json silently describes a same-length
+    # wrong file; receipt records the correct length/digest and never moves.
+    wrong_x = os.urandom(len(blob_x))
+    rewrite_meta(sx, len(blob_x), hashlib.sha256(wrong_x).hexdigest())
+    original_bytes = {i: open(chunk_path(sx, i), "rb").read() for i in range(n_chunks)}
+    receipt_bytes_before = open(os.path.join(DATA, sx, "receipt.json"), "rb").read()
+
+    st, body = call("POST", f"/api/uploads/{sx}/repair", wrong_x)
+    check(st == 400 and "sha256" in body["error"],
+          f"wrong file against contradictory descriptor -> 400, got {st} {body}")
+    st, body2 = call("POST", f"/api/uploads/{sx}/repair", wrong_x)
+    check(st == 400 and body2 == body, "repeated wrong-file repair is a stable 400")
+    check(not os.path.isdir(os.path.join(DATA, sx, "repair")),
+          "refused repair leaves no repair state on disk")
+    for i in range(n_chunks):
+        check(open(chunk_path(sx, i), "rb").read() == original_bytes[i],
+              f"block {i} byte-identical after refused repair")
+    check(open(os.path.join(DATA, sx, "receipt.json"), "rb").read() == receipt_bytes_before,
+          "receipt bytes unchanged after refused repair")
+
+    st, body = call("POST", f"/api/uploads/{sx}/audit")
+    check(st == 200 and body["status"] == "HEALTHY",
+          f"real bytes matching the receipt audit HEALTHY, got {body}")
+    check(body["receipt"] == rx and body["receipt"]["sha256"] == dx,
+          "audit returns the original receipt, not the meta.json forgery")
+    # a descriptor conflict flips to no opposite verdict under repeat audit
+    st, again = call("POST", f"/api/uploads/{sx}/audit")
+    check(again == body, "contradiction verdict is stable across repeat audit")
+
+    # restart stability for the same contradiction
+    restart_web()
+    wait_healthy()
+    st, body = call("POST", f"/api/uploads/{sx}/repair", wrong_x)
+    check(st == 400, f"wrong file still refused after service restart, got {st}")
+    st, body = call("POST", f"/api/uploads/{sx}/audit")
+    check(body["status"] == "HEALTHY" and body["receipt"] == rx,
+          "contradiction keeps the same HEALTHY-with-original-receipt verdict after restart")
+    for i in range(n_chunks):
+        check(open(chunk_path(sx, i), "rb").read() == original_bytes[i],
+              f"block {i} unchanged after restart")
+
+    # legitimate missing-block repair still converges under the conflict:
+    # the wrong file cannot fill the gap, the genuine original can.
+    os.unlink(chunk_path(sx, 1))
+    st, body = call("POST", f"/api/uploads/{sx}/audit")
+    check(body["status"] == "DEGRADED" and body["missing_ranges"] == [[1, 1]],
+          "genuine missing block reported DEGRADED even with descriptor conflict")
+    st, _ = call("POST", f"/api/uploads/{sx}/repair", wrong_x)
+    check(st == 400 and not os.path.isfile(chunk_path(sx, 1)),
+          "wrong file cannot repair the missing block")
+    st, body = call("POST", f"/api/uploads/{sx}/repair", blob_x)
+    check(st == 200 and body["status"] == "HEALTHY",
+          f"real original repairs the gap under conflict, got {st} {body}")
+    check(body["repaired_ranges"] == [[1, 1]], "only the missing block is restored")
+    check(body["receipt"] == rx and body["receipt"]["sealed_at"] == rx["sealed_at"],
+          "receipt id and seal time unchanged by conflict-repair")
+    check(all_chunk_bytes(sx, n_chunks) == blob_x, "all bytes back to the sealed original")
+    check(call("POST", f"/api/uploads/{sx}/audit")[1]["status"] == "HEALTHY",
+          "session converges HEALTHY")
+
+    # (2) missing-block-only session (no descriptor conflict): right file
+    # accepted, semantics identical to the ordinary repair path.
+    os.unlink(chunk_path(sy, 2))
+    st, body = call("POST", f"/api/uploads/{sy}/audit")
+    check(body["status"] == "DEGRADED" and body["missing_ranges"] == [[2, 2]],
+          "plain missing block -> DEGRADED")
+    st, body = call("POST", f"/api/uploads/{sy}/repair", blob_y)
+    check(st == 200 and body["status"] == "HEALTHY", "plain missing-block repair converges")
+    check(body["repaired_ranges"] == [[2, 2]] and body["receipt"] == ry,
+          "only gap restored, receipt preserved")
+    check(all_chunk_bytes(sy, n_chunks) == blob_y, "plain session bytes restored")
+
+    # (3) normal session: repeat audit/repair stay idempotent and healthy.
+    st, body = call("POST", f"/api/uploads/{sz}/audit")
+    check(st == 200 and body["status"] == "HEALTHY" and body["receipt"] == rz,
+          "normal session audits HEALTHY with its receipt")
+    st, body = call("POST", f"/api/uploads/{sz}/repair", blob_z)
+    check(st == 200 and body["already_healthy"] is True and body["receipt"] == rz,
+          "normal repeat repair is an idempotent no-op")
+    check(all_chunk_bytes(sz, n_chunks) == blob_z, "normal session bytes untouched")
+
+    # (4) old session (index removed) under the SAME descriptor conflict,
+    # first audit after a restart: it must not bless the wrong description.
+    os.unlink(os.path.join(DATA, so, "chunk_index.json"))
+    rewrite_meta(so, len(blob_o), hashlib.sha256(os.urandom(len(blob_o))).hexdigest())
+    restart_web()
+    wait_healthy()
+    st, body = call("POST", f"/api/uploads/{so}/audit")
+    check(st == 200 and body["status"] == "HEALTHY",
+          f"old session first audit anchored to receipt -> HEALTHY, got {body}")
+    check(body["receipt"] == ro and body["receipt"]["sha256"] == do,
+          "old session first audit returns the original receipt digest")
+    check(body.get("index_built") is True and os.path.isfile(
+        os.path.join(DATA, so, "chunk_index.json")),
+        "old session first audit builds the trusted index anchored to receipt")
+    st, again = call("POST", f"/api/uploads/{so}/audit")
+    check(again["status"] == "HEALTHY" and again["index_built"] is False,
+          "old session verdict stays HEALTHY on the next audit")
+
+    print(f"\nSMOKE OK against {BASE} (sessions {s}, {sb}, {sa}, {sbx}, {sc}, {sd}, {sx}, {sy}, {sz}, {so})")
 
 
 if __name__ == "__main__":

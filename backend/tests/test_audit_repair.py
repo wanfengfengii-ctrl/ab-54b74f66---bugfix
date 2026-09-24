@@ -660,6 +660,166 @@ def test_single_byte_file_audit_and_repair_roundtrip(client, tmp_path):
     assert client.post("/api/uploads/one/audit").json()["status"] == "HEALTHY"
 
 
+# ---------------------------------------------------------------------------
+# contradictory persisted descriptions after sealing: the receipt is the
+# only root of trust; a rewritten meta.json can never license overwriting
+# sealed blocks or make mismatching bytes audit HEALTHY
+# ---------------------------------------------------------------------------
+
+
+def _rewrite_meta(tmp_path, session, *, total_size, sha256):
+    path = _session_dir(tmp_path, session) / "meta.json"
+    chunk_count = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+    path.write_text(json.dumps({
+        "total_size": total_size,
+        "sha256": sha256,
+        "chunk_count": chunk_count,
+    }))
+
+
+def test_rewritten_meta_wrong_file_repair_refused_zero_changes(client, tmp_path):
+    blob = os.urandom(3 * CHUNK_SIZE + 5)
+    sha, receipt = _make_sealed(client, tmp_path, "cm", blob)
+
+    # A same-length wrong file: only the digest differs.
+    wrong = os.urandom(len(blob))
+    assert len(wrong) == len(blob) and _digest(wrong) != sha
+
+    # The persistent session *description* (meta.json) is silently rewritten
+    # to the wrong file's digest; the receipt itself is untouched.
+    _rewrite_meta(tmp_path, "cm", total_size=len(blob), sha256=_digest(wrong))
+
+    before = {i: _chunk_file(tmp_path, "cm", i).read_bytes() for i in range(4)}
+    receipt_bytes_before = (_session_dir(tmp_path, "cm") / "receipt.json").read_bytes()
+
+    # Handing the wrong file to repair must be stably refused.
+    r1 = client.post("/api/uploads/cm/repair", content=wrong)
+    assert r1.status_code == 400
+    assert "sha256" in r1.json()["error"]
+    r2 = client.post("/api/uploads/cm/repair", content=wrong)
+    assert r2.status_code == 400 and r2.json() == r1.json()
+
+    # Zero data changes: blocks, receipt and absence of repair state.
+    assert not (_session_dir(tmp_path, "cm") / "repair").exists()
+    for i, raw in before.items():
+        assert _chunk_file(tmp_path, "cm", i).read_bytes() == raw
+    assert (_session_dir(tmp_path, "cm") / "receipt.json").read_bytes() == receipt_bytes_before
+
+    # Audit is anchored to the receipt: the real bytes agree with it, so the
+    # session is HEALTHY and the returned receipt still carries the ORIGINAL
+    # digest, never the meta.json forgery.
+    body = client.post("/api/uploads/cm/audit").json()
+    assert body["status"] == "HEALTHY"
+    assert body["receipt"] == receipt
+    assert body["receipt"]["sha256"] == sha != _digest(wrong)
+
+
+def test_contradiction_survives_restart_and_repeated_submission(client, tmp_path):
+    data_dir = tmp_path / "data"
+    blob = os.urandom(2 * CHUNK_SIZE + 9)
+    sha, receipt = _make_sealed(client, tmp_path, "cr", blob)
+    wrong = bytes(b ^ 0xFF for b in blob)  # same length, different digest
+    _rewrite_meta(tmp_path, "cr", total_size=len(blob), sha256=_digest(wrong))
+
+    def assert_refused():
+        r = client.post("/api/uploads/cr/repair", content=wrong)
+        assert r.status_code == 400
+        assert r.json()["error"] == client.post(
+            "/api/uploads/cr/repair", content=wrong
+        ).json()["error"]
+
+    assert_refused()
+    web.store = UploadStore(str(data_dir))  # service restart
+    assert_refused()
+    audit = client.post("/api/uploads/cr/audit").json()
+    assert audit["status"] == "HEALTHY"
+    assert audit["receipt"] == receipt
+    assert audit["receipt"]["sha256"] == sha
+    # a correct repeat repair is still the usual idempotent no-op
+    ok = client.post("/api/uploads/cr/repair", content=blob).json()
+    assert ok["status"] == "HEALTHY" and ok["already_healthy"] is True
+    assert ok["receipt"] == receipt
+
+
+def test_rewritten_meta_with_missing_block_legit_original_repairs(client, tmp_path):
+    blob = os.urandom(3 * CHUNK_SIZE + 7)
+    sha, receipt = _make_sealed(client, tmp_path, "cx", blob)
+    wrong = bytearray(blob)
+    wrong[0] ^= 0x01
+    _rewrite_meta(tmp_path, "cx", total_size=len(blob), sha256=_digest(bytes(wrong)))
+    _chunk_file(tmp_path, "cx", 1).unlink()  # genuine missing block
+
+    audit = client.post("/api/uploads/cx/audit").json()
+    assert audit["status"] == "DEGRADED"
+    assert audit["missing_ranges"] == [[1, 1]]
+    assert audit["receipt"]["sha256"] == sha
+
+    # the wrong same-length file is still not a credential for the gap
+    assert client.post("/api/uploads/cx/repair", content=bytes(wrong)).status_code == 400
+    assert not _chunk_file(tmp_path, "cx", 1).exists()
+
+    # the real original is accepted, fills only the gap, receipt/seal time hold
+    done = client.post("/api/uploads/cx/repair", content=blob).json()
+    assert done["status"] == "HEALTHY"
+    assert done["repaired_ranges"] == [[1, 1]]
+    assert done["receipt"] == receipt
+    assert done["receipt"]["sealed_at"] == receipt["sealed_at"]
+    assert client.post("/api/uploads/cx/audit").json()["status"] == "HEALTHY"
+    for i in range(4):
+        off = i * CHUNK_SIZE
+        assert _chunk_file(tmp_path, "cx", i).read_bytes() == blob[off:off + CHUNK_SIZE]
+
+
+def test_wrong_bytes_on_disk_with_rewritten_meta_still_degraded(client, tmp_path):
+    # The attack's end state: blocks were (somehow) replaced by the wrong
+    # file's bytes and the descriptor agrees with them; only the receipt
+    # still records the truth. Neither audit nor repair may side with the
+    # wrong file, and the genuine original must converge back to HEALTHY.
+    blob = os.urandom(2 * CHUNK_SIZE + 5)
+    sha, receipt = _make_sealed(client, tmp_path, "cw", blob)
+    wrong = os.urandom(len(blob))
+    count = (len(blob) + CHUNK_SIZE - 1) // CHUNK_SIZE
+    for i in range(count):
+        off = i * CHUNK_SIZE
+        (_chunk_file(tmp_path, "cw", i)).write_bytes(wrong[off : off + CHUNK_SIZE])
+    _rewrite_meta(tmp_path, "cw", total_size=len(blob), sha256=_digest(wrong))
+
+    body = client.post("/api/uploads/cw/audit").json()
+    assert body["status"] == "DEGRADED"
+    assert body["receipt"]["sha256"] == sha
+    assert client.post("/api/uploads/cw/repair", content=wrong).status_code == 400
+    done = client.post("/api/uploads/cw/repair", content=blob).json()
+    assert done["status"] == "HEALTHY"
+    assert done["repaired_ranges"] == [[0, 2]]
+    assert done["receipt"] == receipt
+    assert client.post("/api/uploads/cw/audit").json()["status"] == "HEALTHY"
+
+
+def test_rewritten_index_descriptor_also_cannot_authorize_wrong_file(client, tmp_path):
+    blob = os.urandom(2 * CHUNK_SIZE + 4)
+    sha, receipt = _make_sealed(client, tmp_path, "ci", blob)
+    wrong = bytearray(blob)
+    wrong[3] ^= 0x7F
+    wrong = bytes(wrong)
+
+    # Rewrite the OTHER persistent descriptor (chunk_index.json header) to
+    # describe the wrong same-length file.
+    path = _index_file(tmp_path, "ci")
+    idx = json.loads(path.read_text())
+    idx["sha256"] = _digest(wrong)
+    path.write_text(json.dumps(idx))
+
+    assert client.post("/api/uploads/ci/repair", content=wrong).status_code == 400
+    for i in range(3):
+        off = i * CHUNK_SIZE
+        assert _chunk_file(tmp_path, "ci", i).read_bytes() == blob[off:off + CHUNK_SIZE]
+    body = client.post("/api/uploads/ci/audit").json()
+    # bytes still match the receipt: healthy, and the lying index is rebuilt
+    assert body["status"] == "HEALTHY"
+    assert body["receipt"] == receipt
+    assert json.loads(_index_file(tmp_path, "ci").read_text())["sha256"] == sha
+
+
 def test_repair_wrong_length_reports_both_sizes(client, tmp_path):
     blob = os.urandom(CHUNK_SIZE + 3)
     _make_sealed(client, tmp_path, "wl", blob)

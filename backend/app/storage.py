@@ -173,10 +173,48 @@ class UploadStore:
 
     # ---- reads -----------------------------------------------------------
 
+    def _metadata_from_receipt(self, receipt: dict) -> Optional[Metadata]:
+        """Metadata pinned to a sealed receipt, or None if it is unusable.
+
+        The receipt is the immutable seal artifact: once it exists, every
+        verification (lengths, per-chunk index, whole-file digest, repair
+        authorization) must be anchored to ITS digest and size. Any other
+        persisted description that disagrees with the receipt (a silently
+        rewritten meta.json, a forged index) is corrupt evidence and can
+        never license rewriting sealed blocks or bless mismatching bytes.
+        """
+        try:
+            total_size = int(receipt["total_size"])
+            sha256 = str(receipt["sha256"])
+            chunk_count = int(receipt["chunks"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not _is_sha256_hex(sha256):
+            return None
+        if not MIN_TOTAL_SIZE <= total_size <= MAX_TOTAL_SIZE:
+            return None
+        if chunk_count != (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE:
+            return None
+        return Metadata(
+            total_size=total_size, sha256=sha256, chunk_count=chunk_count
+        )
+
     def get_metadata(self, session: str) -> Optional[Metadata]:
         try:
             raw = _read_json(self._meta_path(session))
         except (FileNotFoundError, json.JSONDecodeError):
+            raw = None
+
+        receipt = self._read_receipt(session)
+        if receipt is not None:
+            pinned = self._metadata_from_receipt(receipt)
+            if pinned is not None:
+                # Sealed session: trust the receipt, never a contradictory
+                # meta.json. This also lets a sealed session whose meta.json
+                # went missing be reconstructed from the receipt alone.
+                return pinned
+
+        if raw is None:
             return None
         return Metadata(
             total_size=int(raw["total_size"]),
