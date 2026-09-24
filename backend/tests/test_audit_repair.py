@@ -667,3 +667,191 @@ def test_repair_wrong_length_reports_both_sizes(client, tmp_path):
     assert r.status_code == 400
     msg = r.json()["error"]
     assert str(len(blob) - 1) in msg and str(len(blob)) in msg
+
+
+# ---------------------------------------------------------------------------
+# contradictory persisted descriptions: the receipt is the root of trust
+# ---------------------------------------------------------------------------
+
+
+def _meta_file(tmp_path, session):
+    return _session_dir(tmp_path, session) / "meta.json"
+
+
+def _tamper_description(tmp_path, session, wrong_blob, forge_index=True):
+    """Silently rewrite the persisted session description (meta.json, and
+    optionally the per-chunk index) to a same-length wrong file's digest,
+    leaving the sealed receipt itself untouched."""
+    meta_path = _meta_file(tmp_path, session)
+    meta = json.loads(meta_path.read_text())
+    meta["sha256"] = _digest(wrong_blob)
+    meta_path.write_text(json.dumps(meta, indent=2))
+    index_path = _index_file(tmp_path, session)
+    if forge_index and index_path.exists():
+        index = json.loads(index_path.read_text())
+        index["sha256"] = _digest(wrong_blob)
+        for entry in index["chunks"]:
+            off = entry["i"] * CHUNK_SIZE
+            entry["sha256"] = _digest(wrong_blob[off : off + entry["size"]])
+        index_path.write_text(json.dumps(index, indent=2))
+
+
+def test_tampered_description_wrong_file_rejected_with_zero_change(client, tmp_path):
+    blob = os.urandom(3 * CHUNK_SIZE + 9)
+    wrong = os.urandom(len(blob))  # same length, different content
+    _, receipt = _make_sealed(client, tmp_path, "cf", blob)
+    _tamper_description(tmp_path, "cf", wrong)
+
+    before = {i: _chunk_file(tmp_path, "cf", i).read_bytes() for i in range(4)}
+    r1 = client.post("/api/uploads/cf/repair", content=wrong)
+    assert r1.status_code == 400
+    assert "sha256" in r1.json()["error"]
+    # repeating the same wrong file gives the identical stable answer
+    r2 = client.post("/api/uploads/cf/repair", content=wrong)
+    assert r2.status_code == 400 and r2.json() == r1.json()
+
+    # zero change: sealed bytes, receipt and (absence of) repair state intact
+    for i, raw in before.items():
+        assert _chunk_file(tmp_path, "cf", i).read_bytes() == raw
+    assert not (_session_dir(tmp_path, "cf") / "repair").exists()
+    receipt_path = _session_dir(tmp_path, "cf") / "receipt.json"
+    assert json.loads(receipt_path.read_text()) == receipt
+
+    # the audit anchors on the receipt: the untouched bytes still match it
+    body = client.post("/api/uploads/cf/audit").json()
+    assert body["status"] == "HEALTHY"
+    assert body["receipt"] == receipt
+    whole = b"".join(_chunk_file(tmp_path, "cf", i).read_bytes() for i in range(4))
+    assert body["receipt"]["sha256"] == _digest(whole)
+
+
+def test_tampered_description_verdicts_stable_across_restart(client, tmp_path):
+    data_dir = tmp_path / "data"
+    blob = os.urandom(2 * CHUNK_SIZE + 3)
+    wrong = os.urandom(len(blob))
+    _, receipt = _make_sealed(client, tmp_path, "cr", blob)
+    _tamper_description(tmp_path, "cr", wrong)
+
+    web.store = UploadStore(str(data_dir))  # service restart over the same volume
+    assert client.post("/api/uploads/cr/repair", content=wrong).status_code == 400
+    body = client.post("/api/uploads/cr/audit").json()
+    assert body["status"] == "HEALTHY"
+    assert body["receipt"] == receipt
+
+    # another restart: the same contradictory state gets the same verdicts
+    web.store = UploadStore(str(data_dir))
+    assert client.post("/api/uploads/cr/repair", content=wrong).status_code == 400
+    again = client.post("/api/uploads/cr/audit").json()
+    assert again["status"] == "HEALTHY"
+    assert again["receipt"] == receipt
+
+
+def test_tampered_description_correct_file_still_repairs(client, tmp_path):
+    blob = os.urandom(3 * CHUNK_SIZE + 1)
+    wrong = os.urandom(len(blob))
+    _, receipt = _make_sealed(client, tmp_path, "cc", blob)
+    _tamper_description(tmp_path, "cc", wrong)
+    _chunk_file(tmp_path, "cc", 1).unlink()  # missing block
+    _flip(_chunk_file(tmp_path, "cc", 2))  # and a bit flip
+
+    # anchored on the receipt, the audit still reports the real damage
+    body = client.post("/api/uploads/cc/audit").json()
+    assert body["status"] == "DEGRADED"
+    assert body["missing_ranges"] == [[1, 1]]
+
+    # the true original is accepted and converges; receipt/seal time untouched
+    done = client.post("/api/uploads/cc/repair", content=blob).json()
+    assert done["status"] == "HEALTHY"
+    assert done["repaired_ranges"] == [[1, 2]]
+    assert done["receipt"] == receipt
+    assert done["receipt"]["sealed_at"] == receipt["sealed_at"]
+    assert client.post("/api/uploads/cc/audit").json()["status"] == "HEALTHY"
+    again = client.post("/api/uploads/cc/repair", content=blob).json()
+    assert again["already_healthy"] is True
+
+
+def test_tampered_description_old_session_first_audit_anchors_on_receipt(
+    client, tmp_path
+):
+    data_dir = tmp_path / "data"
+    blob = os.urandom(2 * CHUNK_SIZE + 5)
+    wrong = os.urandom(len(blob))
+    _, receipt = _make_sealed(client, tmp_path, "co", blob)
+    _index_file(tmp_path, "co").unlink()  # old session: no per-chunk index
+    _tamper_description(tmp_path, "co", wrong, forge_index=False)
+
+    web.store = UploadStore(str(data_dir))  # restart before the first audit
+    body = client.post("/api/uploads/co/audit").json()
+    assert body["status"] == "HEALTHY"
+    assert body["index_built"] is True
+    assert body["receipt"] == receipt
+    # the rebuilt index is anchored on the receipt, not the tampered meta.json
+    index = json.loads(_index_file(tmp_path, "co").read_text())
+    assert index["sha256"] == receipt["sha256"]
+
+    web.store = UploadStore(str(data_dir))  # one more restart: same verdicts
+    again = client.post("/api/uploads/co/audit").json()
+    assert again["status"] == "HEALTHY" and again["index_built"] is False
+    assert client.post("/api/uploads/co/repair", content=wrong).status_code == 400
+
+
+def test_tampered_description_cannot_disturb_paused_repair(client, tmp_path):
+    blob = os.urandom(3 * CHUNK_SIZE + 1)
+    wrong = os.urandom(len(blob))
+    _, receipt = _make_sealed(client, tmp_path, "cp", blob)
+    _flip(_chunk_file(tmp_path, "cp", 0))
+    _flip(_chunk_file(tmp_path, "cp", 2))
+
+    web.store.repair_block_limit = 1
+    paused = client.post("/api/uploads/cp/repair", content=blob).json()
+    assert paused["status"] == "REPAIRING"
+
+    # the description is silently rewritten mid-repair; drop all memory
+    _tamper_description(tmp_path, "cp", wrong)
+    web.store = UploadStore(str(tmp_path / "data"))
+    web.store.repair_block_limit = 1
+
+    # the persisted plan still matches the receipt, so it is honoured
+    body = client.post("/api/uploads/cp/audit").json()
+    assert body["status"] == "REPAIRING"
+    assert body["remaining_ranges"] == [[2, 2]]
+    # the wrong file is refused without disturbing the plan
+    assert client.post("/api/uploads/cp/repair", content=wrong).status_code == 400
+    assert client.post("/api/uploads/cp/audit").json() == body
+    # the true original converges with the receipt untouched
+    web.store.repair_block_limit = None
+    done = client.post("/api/uploads/cp/repair", content=blob).json()
+    assert done["status"] == "HEALTHY"
+    assert done["receipt"] == receipt
+
+
+def test_sealed_chunk_api_ignores_tampered_description(client, tmp_path):
+    blob = os.urandom(CHUNK_SIZE + 1)
+    wrong = os.urandom(len(blob))
+    sha = _digest(blob)
+    _make_sealed(client, tmp_path, "ck", blob)
+    _tamper_description(tmp_path, "ck", wrong)
+    # identical retransmission of the receipted bytes stays an idempotent 200
+    r = _put(client, "ck", 0, blob[:CHUNK_SIZE], len(blob), sha)
+    assert r.status_code == 200 and r.json()["duplicate"] is True
+    # the tampered description cannot pin the wrong file's digest either
+    assert _put(client, "ck", 0, blob[:CHUNK_SIZE], len(blob), _digest(wrong)).status_code == 409
+    # status reports the receipt-anchored view of the sealed session
+    body = client.get("/api/uploads/ck").json()
+    assert body["sha256"] == sha
+    assert body["sealed"] is True
+
+
+def test_internally_inconsistent_receipt_never_reports_healthy(client, tmp_path):
+    blob = os.urandom(CHUNK_SIZE + 1)
+    _make_sealed(client, tmp_path, "ir", blob)
+    receipt_path = _session_dir(tmp_path, "ir") / "receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["sha256"] = "0" * 64  # no longer matches the receipt id
+    receipt_path.write_text(json.dumps(receipt, indent=2))
+
+    body = client.post("/api/uploads/ir/audit").json()
+    assert body["status"] == "DEGRADED"
+    assert body["unlocated_digest_mismatch"] is True
+    # no file can be verified against a broken anchor: repair is refused
+    assert client.post("/api/uploads/ir/repair", content=blob).status_code == 409

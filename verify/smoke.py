@@ -350,7 +350,51 @@ def main():
     status, body = call("POST", f"/api/uploads/{sd}/audit")
     check(body["status"] == "HEALTHY", "final audit after resume is HEALTHY")
 
-    print(f"\nSMOKE OK against {BASE} (sessions {s}, {sb}, {sa}, {sbx}, {sc}, {sd})")
+    print("[contradictory persisted description: the receipt stays the root of trust]")
+    blob_e = os.urandom(3 * CHUNK + 33)
+    se = s + "F"
+    _, rcpt_e = upload_and_seal(se, blob_e)
+    wrong_e = os.urandom(len(blob_e))  # same length, different content
+    wrong_d = hashlib.sha256(wrong_e).hexdigest()
+    # silently rewrite the persisted session description (meta.json + index)
+    # to the wrong file's digest; the sealed receipt itself is untouched
+    meta_file = os.path.join(DATA, se, "meta.json")
+    with open(meta_file) as fh:
+        meta = json.load(fh)
+    meta["sha256"] = wrong_d
+    with open(meta_file, "w") as fh:
+        json.dump(meta, fh, indent=2)
+    index_file = os.path.join(DATA, se, "chunk_index.json")
+    with open(index_file) as fh:
+        idx = json.load(fh)
+    idx["sha256"] = wrong_d
+    for entry in idx["chunks"]:
+        off = entry["i"] * CHUNK
+        entry["sha256"] = hashlib.sha256(wrong_e[off : off + entry["size"]]).hexdigest()
+    with open(index_file, "w") as fh:
+        json.dump(idx, fh, indent=2)
+
+    chunks_before = [open(chunk_path(se, i), "rb").read() for i in range(4)]
+    st, body = call("POST", f"/api/uploads/{se}/repair", wrong_e)
+    check(st == 400, "wrong file against a tampered description -> stable 400")
+    st, body2 = call("POST", f"/api/uploads/{se}/repair", wrong_e)
+    check(st == 400 and body2 == body, "repeated wrong file -> identical 400")
+    chunks_after = [open(chunk_path(se, i), "rb").read() for i in range(4)]
+    check(chunks_before == chunks_after, "refused repair changed no sealed bytes")
+    check(not os.path.isdir(os.path.join(DATA, se, "repair")),
+          "refused repair left no repair state behind")
+    status, body = call("POST", f"/api/uploads/{se}/audit")
+    check(body["status"] == "HEALTHY" and body["receipt"] == rcpt_e,
+          "audit anchors on the receipt, not the tampered description")
+    check(body["receipt"]["sha256"] == hashlib.sha256(b"".join(chunks_after)).hexdigest(),
+          "reported receipt digest matches the actual sealed bytes")
+    status, body = call("POST", f"/api/uploads/{se}/repair", blob_e)
+    check(body["status"] == "HEALTHY" and body["already_healthy"] is True,
+          "true original still accepted under a contradictory description")
+    check(body["receipt"] == rcpt_e and body["receipt"]["sealed_at"] == rcpt_e["sealed_at"],
+          "receipt and seal time unchanged through the conflict")
+
+    print(f"\nSMOKE OK against {BASE} (sessions {s}, {sb}, {sa}, {sbx}, {sc}, {sd}, {se})")
 
 
 if __name__ == "__main__":

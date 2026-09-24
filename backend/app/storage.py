@@ -204,6 +204,35 @@ class UploadStore:
             return None
         return raw
 
+    def _receipt_meta(self, receipt: dict) -> Optional[Metadata]:
+        """Pinned metadata anchored on the sealed receipt.
+
+        For a sealed session the receipt is the single root of trust: any
+        other persisted description (meta.json, a hand-written repair plan,
+        ...) contradicting it is silent corruption and is ignored, so a
+        wrong file can never become a credential for rewriting sealed
+        blocks. Returns None when the receipt itself is internally
+        inconsistent, in which case it can anchor no verification.
+        """
+        try:
+            total_size = int(receipt["total_size"])
+            sha256 = str(receipt["sha256"])
+            chunks = int(receipt["chunks"])
+            chunk_size = int(receipt.get("chunk_size", CHUNK_SIZE))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None
+        if not _is_sha256_hex(sha256):
+            return None
+        if chunk_size != CHUNK_SIZE:
+            return None
+        if not MIN_TOTAL_SIZE <= total_size <= MAX_TOTAL_SIZE:
+            return None
+        if chunks != (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE:
+            return None
+        if str(receipt.get("receipt_id")) != _DIGEST_PREFIX + sha256:
+            return None
+        return Metadata(total_size=total_size, sha256=sha256, chunk_count=chunks)
+
     def _read_index(self, session: str, meta: Metadata) -> Optional[list[dict]]:
         """Trusted per-chunk digests, or None when absent/unusable.
 
@@ -276,8 +305,14 @@ class UploadStore:
             meta = self.get_metadata(session)
             if meta is None:
                 return None
-            present = sorted(self._present_indices(session, meta.chunk_count))
             receipt = self._read_receipt(session)
+            if receipt is not None:
+                # A sealed session is described by its receipt; a silently
+                # corrupted meta.json must not leak into the reported state.
+                anchored = self._receipt_meta(receipt)
+                if anchored is not None:
+                    meta = anchored
+            present = sorted(self._present_indices(session, meta.chunk_count))
             return {
                 "session": session,
                 "total_size": meta.total_size,
@@ -312,12 +347,20 @@ class UploadStore:
 
         with self._lock:
             existing = self.get_metadata(session)
+            receipt = self._read_receipt(session)
             if existing is None:
                 # Build + validate in memory first; nothing touches disk until
                 # every shape check has passed.
                 meta = self._build_metadata(total_size, sha256)
             else:
                 meta = existing
+                if receipt is not None:
+                    # Once sealed, the receipt pins the metadata: a silently
+                    # corrupted meta.json cannot redefine what counts as an
+                    # identical retransmission.
+                    anchored = self._receipt_meta(receipt)
+                    if anchored is not None:
+                        meta = anchored
                 if total_size is not None and total_size != meta.total_size:
                     raise ConflictError(
                         f"total_size mismatch: session pinned to {meta.total_size}"
@@ -353,7 +396,7 @@ class UploadStore:
                     ).encode(),
                 )
 
-            sealed = self._read_receipt(session) is not None
+            sealed = receipt is not None
             path = self._chunk_path(session, index)
             if os.path.exists(path):
                 with open(path, "rb") as fh:
@@ -608,6 +651,28 @@ class UploadStore:
                     "session is not sealed; integrity audit is sealed-only"
                 )
 
+            # The sealed receipt is the root of trust for every check below.
+            # A meta.json (or any other persisted description) contradicting
+            # it is silent corruption and is ignored, so content that
+            # disagrees with the receipt can never audit HEALTHY. A receipt
+            # that is itself internally inconsistent anchors nothing.
+            anchored = self._receipt_meta(receipt)
+            if anchored is None:
+                return self._audit_response(
+                    session,
+                    meta,
+                    receipt,
+                    "DEGRADED",
+                    index_present=False,
+                    index_built=False,
+                    missing=set(),
+                    bad_length=set(),
+                    digest_mismatch=set(),
+                    mismatch_located=False,
+                    unlocated_mismatch=True,
+                )
+            meta = anchored
+
             index = self._read_index(session, meta)
 
             state = self._read_repair_state(session, meta)
@@ -747,6 +812,17 @@ class UploadStore:
             receipt = self._read_receipt(session)
             if receipt is None:
                 raise ConflictError("session is not sealed; repair is sealed-only")
+            # The receipt, not meta.json, decides which file is the original:
+            # a silently rewritten session description must never turn a
+            # wrong file into a credential for rewriting sealed blocks. All
+            # validation happens before anything is written, so a refused
+            # file leaves every byte and every state file untouched.
+            anchored = self._receipt_meta(receipt)
+            if anchored is None:
+                raise ConflictError(
+                    "sealed receipt is internally inconsistent; repair is refused"
+                )
+            meta = anchored
             receipt_before = json.dumps(receipt, sort_keys=True)
 
             # The uploaded file is accepted only when it IS the receipted
